@@ -1,17 +1,17 @@
-import { restClient, websocket } from '@polygon.io/client-js';
+import { restClient } from '@polygon.io/client-js';
 import { format } from 'date-fns';
 import { PriceData } from '../types/trading';
 
 const POLYGON_API_KEY = import.meta.env.VITE_POLYGON_API_KEY;
 const rest = restClient(POLYGON_API_KEY);
-const ws = websocket.stocks(POLYGON_API_KEY);
 
 export class MarketDataService {
   private static instance: MarketDataService;
   private subscribers: ((data: PriceData) => void)[] = [];
+  private pollingInterval: number | null = null;
   
   private constructor() {
-    this.initializeWebSocket();
+    this.startPolling();
   }
 
   static getInstance(): MarketDataService {
@@ -21,27 +21,39 @@ export class MarketDataService {
     return this.instance;
   }
 
-  private initializeWebSocket() {
-    ws.subscribe('XAU/USD');
-    
-    ws.on('message', (data: any) => {
-      if (data.ev === 'A') { // Aggregate event
-        const priceData: PriceData = {
-          timestamp: data.t,
-          open: data.o,
-          high: data.h,
-          low: data.l,
-          close: data.c,
-          volume: data.v
-        };
-        
-        this.notifySubscribers(priceData);
-      }
-    });
+  private async startPolling() {
+    // Poll every 5 seconds for new data
+    this.pollingInterval = window.setInterval(async () => {
+      const now = new Date();
+      const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+      
+      try {
+        const response = await rest.forex.aggregates(
+          'XAU',
+          'USD',
+          1, // 1-minute intervals for more granular updates
+          format(fiveMinutesAgo, 'yyyy-MM-dd'),
+          format(now, 'yyyy-MM-dd'),
+          { limit: 5 }
+        );
 
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
-    });
+        if (response.results && response.results.length > 0) {
+          const latestBar = response.results[response.results.length - 1];
+          const priceData: PriceData = {
+            timestamp: latestBar.t,
+            open: latestBar.o,
+            high: latestBar.h,
+            low: latestBar.l,
+            close: latestBar.c,
+            volume: latestBar.v
+          };
+          
+          this.notifySubscribers(priceData);
+        }
+      } catch (error) {
+        console.error('Error polling data:', error);
+      }
+    }, 5000);
   }
 
   async getHistoricalData(from: Date, to: Date): Promise<PriceData[]> {
@@ -81,6 +93,9 @@ export class MarketDataService {
   }
 
   disconnect() {
-    ws.disconnect();
+    if (this.pollingInterval !== null) {
+      window.clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
   }
 }
