@@ -4,57 +4,47 @@ import { PriceData } from '../types/trading';
 
 const POLYGON_API_KEY = import.meta.env.VITE_POLYGON_API_KEY;
 if (!POLYGON_API_KEY) {
-  throw new Error('Polygon.io API key is required. Please set VITE_POLYGON_API_KEY in your .env file.');
+  throw new Error('Polygon.io API key is required');
 }
-
-const rest = restClient(POLYGON_API_KEY);
 
 export class MarketDataService {
   private static instance: MarketDataService;
+  private rest = restClient(POLYGON_API_KEY);
   private subscribers: ((data: PriceData) => void)[] = [];
   private pollingInterval: number | null = null;
   private lastKnownPrice: PriceData | null = null;
-  private retryCount = 0;
-  private readonly MAX_RETRIES = 3;
-  private readonly RETRY_DELAY = 5000; // 5 seconds
+
+  private readonly POLLING_INTERVAL = 30000; // 30 seconds
+  private readonly RETRY_INTERVALS = [5000, 10000, 30000]; // Exponential backoff
 
   private constructor() {
-    this.initializeLastPrice()
-      .then(() => this.startPolling())
-      .catch(error => {
-        console.error('Failed to initialize market data service:', error);
-        this.scheduleRetry();
-      });
+    this.initializeDataStream();
   }
 
   static getInstance(): MarketDataService {
-    if (!this.instance) {
-      this.instance = new MarketDataService();
-    }
-    return this.instance;
+    return this.instance || (this.instance = new MarketDataService());
   }
 
-  private scheduleRetry() {
-    if (this.retryCount < this.MAX_RETRIES) {
-      this.retryCount++;
-      setTimeout(() => {
-        this.initializeLastPrice()
-          .then(() => this.startPolling())
-          .catch(error => {
-            console.error(`Retry ${this.retryCount} failed:`, error);
-            this.scheduleRetry();
-          });
-      }, this.RETRY_DELAY * this.retryCount);
-    } else {
-      console.error('Max retries reached. Unable to initialize market data service.');
+  private async initializeDataStream(retryIndex = 0) {
+    try {
+      await this.fetchLatestPrice();
+      this.startPolling();
+    } catch (error) {
+      console.error('Data stream initialization failed:', error);
+      
+      if (retryIndex < this.RETRY_INTERVALS.length) {
+        setTimeout(() => {
+          this.initializeDataStream(retryIndex + 1);
+        }, this.RETRY_INTERVALS[retryIndex]);
+      }
     }
   }
 
-  private async initializeLastPrice() {
+  private async fetchLatestPrice() {
     const now = new Date();
     const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     
-    const response = await rest.forex.aggregates(
+    const response = await this.rest.forex.aggregates(
       'C:XAUUSD', 
       1, 
       'minute', 
@@ -63,7 +53,7 @@ export class MarketDataService {
       { limit: 1, sort: 'desc' }
     );
 
-    if (response.results && response.results.length > 0) {
+    if (response.results?.length) {
       const latestBar = response.results[0];
       this.lastKnownPrice = {
         timestamp: latestBar.t,
@@ -77,44 +67,40 @@ export class MarketDataService {
     }
   }
 
-  private async startPolling() {
-    // Reduce polling frequency to avoid rate limits
+  private startPolling() {
+    this.stopPolling(); // Ensure no duplicate intervals
     this.pollingInterval = window.setInterval(async () => {
       try {
-        const now = new Date();
-        const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
-        
-        const response = await rest.forex.aggregates(
-          'C:XAUUSD', 
-          1, 
-          'minute', 
-          format(fiveMinutesAgo, 'yyyy-MM-dd'),
-          format(now, 'yyyy-MM-dd'),
-          { limit: 1, sort: 'desc' }
-        );
-
-        if (response.results && response.results.length > 0) {
-          const latestBar = response.results[0];
-          const priceData: PriceData = {
-            timestamp: latestBar.t,
-            open: latestBar.o,
-            high: latestBar.h,
-            low: latestBar.l,
-            close: latestBar.c,
-            volume: latestBar.v
-          };
-          
-          if (!this.lastKnownPrice || this.lastKnownPrice.timestamp !== priceData.timestamp) {
-            this.lastKnownPrice = priceData;
-            this.notifySubscribers(priceData);
-          }
-        }
+        await this.fetchLatestPrice();
       } catch (error) {
-        console.error('Error polling data:', error);
-        this.scheduleRetry();
+        console.error('Polling error:', error);
       }
-    }, 15000); // Increased to 15 seconds to reduce API calls
+    }, this.POLLING_INTERVAL);
   }
 
-  // Rest of the methods remain the same...
+  private stopPolling() {
+    if (this.pollingInterval) {
+      window.clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
+  }
+
+  private notifySubscribers(data: PriceData) {
+    this.subscribers.forEach(callback => callback(data));
+  }
+
+  subscribe(callback: (data: PriceData) => void) {
+    this.subscribers.push(callback);
+    if (this.lastKnownPrice) {
+      callback(this.lastKnownPrice);
+    }
+    return () => {
+      this.subscribers = this.subscribers.filter(cb => cb !== callback);
+    };
+  }
+
+  disconnect() {
+    this.stopPolling();
+    this.subscribers = [];
+  }
 }
